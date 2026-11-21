@@ -56,6 +56,8 @@ public class TouchpadView extends View implements View.OnCapturedPointerListener
     private MouseMovementListener mouseMovementListener;
     private int lastAbsoluteMouseX, lastAbsoluteMouseY;
     private boolean hasAbsoluteMousePosition;
+    private boolean stylusRightClickActive = false;
+    private boolean stylusTipTouching = false;
 
     public void setMouseMovementListener(MouseMovementListener listener) {
         mouseMovementListener = listener;
@@ -397,6 +399,33 @@ public class TouchpadView extends View implements View.OnCapturedPointerListener
         return super.onHoverEvent(event);
     }
 
+    @Override
+    public boolean onGenericMotionEvent(MotionEvent event) {
+        if (isEventTriggeredByStylus(event)) {
+            int action = event.getActionMasked();
+            if (action == MotionEvent.ACTION_BUTTON_PRESS) {
+                if (isStylusActionButton(event.getActionButton()) && !stylusRightClickActive) {
+                    // Release left first: ACTION_BUTTON_PRESS can arrive while the tip is
+                    // already down (left click active), and both buttons must not be held at once.
+                    xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_LEFT);
+                    xServer.injectPointerButtonPress(Pointer.Button.BUTTON_RIGHT);
+                    setStylusRightClickActive(true);
+                }
+                return true;
+            } else if (action == MotionEvent.ACTION_BUTTON_RELEASE) {
+                // Release right unconditionally — harmless if already released.
+                // Do NOT call setStylusRightClickActive(false) here: if the tip is still
+                // touching, stylusRightClickActive must stay true so that the next
+                // ACTION_MOVE's updateStylusRightClickState detects the button-released
+                // transition and restores the left button. Clearing it here would cause
+                // updateStylusRightClickState to see no change and silently leave left unrestored.
+                xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_RIGHT);
+                return true;
+            }
+        }
+        return super.onGenericMotionEvent(event);
+    }
+
     private boolean handleStylusHoverEvent(MotionEvent event) {
         if (xServer.isRelativeMouseMovement()) return false;
 
@@ -405,12 +434,18 @@ public class TouchpadView extends View implements View.OnCapturedPointerListener
             case MotionEvent.ACTION_HOVER_ENTER:
                 hasAbsoluteMousePosition = false;
                 Timber.tag("StylusEvent").d("Hover Enter");
+                // fall through
             case MotionEvent.ACTION_HOVER_MOVE:
                 Timber.tag("StylusEvent").d("Hover Move: (" + event.getX() + ", " + event.getY() + ")");
                 handleStylusMove(event);
+                updateStylusRightClickState(event, false);
                 break;
             case MotionEvent.ACTION_HOVER_EXIT:
                 Timber.tag("StylusEvent").d("Hover Exit");
+                if (stylusRightClickActive) {
+                    setStylusRightClickActive(false);
+                    xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_RIGHT);
+                }
                 break;
             default:
                 return false;
@@ -423,22 +458,55 @@ public class TouchpadView extends View implements View.OnCapturedPointerListener
 
         switch (action) {
             case MotionEvent.ACTION_DOWN:
-                if (isStylusButtonPressed(event)) {
+                stylusTipTouching = true;
+                setStylusRightClickActive(isStylusButtonPressed(event));
+                if (stylusRightClickActive) {
                     handleStylusRightClick(event);
                 } else {
                     handleStylusLeftClick(event);
                 }
                 break;
             case MotionEvent.ACTION_MOVE:
+                updateStylusRightClickState(event, true);
                 handleStylusMove(event);
                 break;
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
+                stylusTipTouching = false;
                 handleStylusUp(event);
+                setStylusRightClickActive(false);
+                break;
+            default:
+                // Some devices (e.g. Samsung S Pen with side button held) emit vendor-specific
+                // action codes instead of ACTION_MOVE. They carry valid position and buttonState,
+                // so treat them as a move rather than dropping them and freezing the cursor.
+                // Use stylusTipTouching (not a hardcoded true) so that air-gesture events during
+                // hover don't falsely trigger the left↔right button swap.
+                updateStylusRightClickState(event, stylusTipTouching);
+                handleStylusMove(event);
                 break;
         }
 
         return true;
+    }
+
+    private void updateStylusRightClickState(MotionEvent event, boolean isTouching) {
+        boolean buttonPressedNow = isStylusButtonPressed(event);
+        if (buttonPressedNow == stylusRightClickActive) return;
+
+        setStylusRightClickActive(buttonPressedNow);
+        if (stylusRightClickActive) {
+            // Atomically swap left for right when transitioning mid-stroke.
+            if (isTouching) xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_LEFT);
+            xServer.injectPointerButtonPress(Pointer.Button.BUTTON_RIGHT);
+        } else {
+            xServer.injectPointerButtonRelease(Pointer.Button.BUTTON_RIGHT);
+            if (isTouching) xServer.injectPointerButtonPress(Pointer.Button.BUTTON_LEFT);
+        }
+    }
+
+    private void setStylusRightClickActive(boolean active) {
+        stylusRightClickActive = active;
     }
 
     private static boolean isEventTriggeredByStylus(MotionEvent event) {
@@ -454,6 +522,12 @@ public class TouchpadView extends View implements View.OnCapturedPointerListener
         )) != 0;
         boolean toolSetToEraser = event.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER;
         return stylusButtonPressed || toolSetToEraser;
+    }
+
+    private static boolean isStylusActionButton(int actionButton) {
+        return actionButton == MotionEvent.BUTTON_STYLUS_PRIMARY
+                || actionButton == MotionEvent.BUTTON_STYLUS_SECONDARY
+                || actionButton == MotionEvent.BUTTON_SECONDARY;
     }
 
     private void handleStylusLeftClick(MotionEvent event) {
